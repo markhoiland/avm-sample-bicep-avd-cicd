@@ -1,0 +1,352 @@
+# ============================================================================
+# deploy-avd.yml  –  Azure Virtual Desktop CI/CD Pipeline
+# ============================================================================
+# Deploys AVD infrastructure using a single subscription-scope orchestration
+# template at bicep/main.bicep.
+#
+# Authentication: OpenID Connect (OIDC) – no long-lived credentials stored.
+# Required secrets (set in GitHub → Settings → Secrets and Variables → Actions):
+#   AZURE_CLIENT_ID       – App Registration client/application ID
+#   AZURE_TENANT_ID       – Entra ID (Azure AD) tenant ID
+#   AZURE_SUBSCRIPTION_ID – Target Azure subscription ID
+#
+# Optional secrets (required when deploySessionHosts=true in bicepparam):
+#   SESSION_HOST_ADMIN_PASSWORD – Local admin password for session host VMs
+#     The host pool registration token is generated automatically at deploy time
+#     (no pipeline secret needed for the token).
+#
+# Autoscale RBAC: The workflow attempts to resolve the Windows Virtual Desktop
+# service principal object ID at runtime via az ad sp show. If the deployment SP
+# has Microsoft Graph read access the RBAC assignment is made automatically. If
+# not, a warning is emitted and the role must already exist from a prior run.
+#
+# Resource group name/location and module settings are defined in:
+#   bicep/main.bicepparam
+# ============================================================================
+
+name: Deploy AVD Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bicep/main.bicep'
+      - 'bicep/main.bicepparam'
+      - 'bicep/main.staging.bicepparam'
+      - 'bicep/modules/**'
+      - '.github/workflows/deploy-avd.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'bicep/main.bicep'
+      - 'bicep/main.bicepparam'
+      - 'bicep/main.staging.bicepparam'
+      - 'bicep/modules/**'
+      - '.github/workflows/deploy-avd.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      deploymentLocation:
+        description: 'Azure region for subscription deployment metadata'
+        required: false
+        default: 'eastus'
+        type: string
+      parameterFileOverride:
+        description: 'Optional explicit bicepparam path (for example bicep/main.staging.bicepparam)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  id-token: write   # Required for OIDC token request
+  contents: read    # Required to checkout the repository
+
+env:
+  BICEP_VERSION: 'latest'
+  DEPLOYMENT_LOCATION: 'eastus'
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Validate – runs on every push and PR; no Azure changes are made
+  # ──────────────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate Bicep Templates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Bicep CLI
+        run: |
+          curl -Lo /tmp/bicep-linux-x64 https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x /tmp/bicep-linux-x64
+          sudo mv /tmp/bicep-linux-x64 /usr/local/bin/bicep
+          bicep --version
+
+      - name: Build / lint host-pool
+        run: bicep build bicep/modules/host-pool/main.bicep
+
+      - name: Build / lint application-group
+        run: bicep build bicep/modules/application-group/main.bicep
+
+      - name: Build / lint workspace
+        run: bicep build bicep/modules/workspace/main.bicep
+
+      - name: Build / lint scaling-plan
+        run: bicep build bicep/modules/scaling-plan/main.bicep
+
+      - name: Build / lint avd-autoscale-rbac
+        run: bicep build bicep/modules/avd-autoscale-rbac/main.bicep
+
+      - name: Build / lint vnet
+        run: bicep build bicep/modules/vnet/main.bicep
+
+      - name: Build / lint session-hosts
+        run: bicep build bicep/modules/session-hosts/main.bicep
+
+      - name: Build / lint platform orchestration
+        run: bicep build bicep/main.bicep
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # What-if – runs on PRs to preview planned changes (no deployment)
+  # ──────────────────────────────────────────────────────────────────────────
+  what-if:
+    name: What-If Preview
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-if – Platform
+        uses: azure/cli@v2
+        env:
+          SESSION_HOST_ADMIN_PASSWORD: ${{ secrets.SESSION_HOST_ADMIN_PASSWORD }}
+          AVD_SP_OBJECT_ID_SECRET: ${{ secrets.AVD_SP_OBJECT_ID }}
+        with:
+          azcliversion: latest
+          inlineScript: |
+            SESSION_HOST_PARAMS=()
+            if [ -n "$SESSION_HOST_ADMIN_PASSWORD" ]; then
+              SESSION_HOST_PARAMS+=(--parameters "sessionHostAdminPassword=$SESSION_HOST_ADMIN_PASSWORD")
+            fi
+            # Resolve the AVD service principal object ID so the Bicep template can grant
+            # it "Desktop Virtualization Power On Off Contributor" on the resource group
+            # (required for the Scaling Plan to manage host power state).
+            # Prefer the AVD_SP_OBJECT_ID repository secret (avoids needing Microsoft Graph
+            # permissions on the workload identity and guarantees the correct SP object ID).
+            # Falls back to az ad sp show if the secret is not configured and Graph permissions
+            # are available. If neither source yields a value, the RBAC module is skipped.
+            AVD_SP_PARAMS=()
+            if [ -n "$AVD_SP_OBJECT_ID_SECRET" ]; then
+              AVD_SP_OBJECT_ID="$AVD_SP_OBJECT_ID_SECRET"
+            else
+              set +e
+              AVD_SP_OBJECT_ID=$(az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07 --query id -o tsv 2>/dev/null)
+              set -e
+            fi
+            if [ -n "$AVD_SP_OBJECT_ID" ]; then
+              AVD_SP_PARAMS+=(--parameters "avdServicePrincipalObjectId=$AVD_SP_OBJECT_ID")
+            else
+              echo "::warning::Could not resolve avdServicePrincipalObjectId. Set the AVD_SP_OBJECT_ID repository secret (az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07 --query id -o tsv), or grant the deployment SP 'Application.Read.All'. The autoscale RBAC module will be skipped."
+            fi
+            az deployment sub what-if \
+              --name "avd-platform-whatif-${{ github.run_id }}" \
+              --location "${{ github.event.inputs.deploymentLocation || env.DEPLOYMENT_LOCATION }}" \
+              --template-file bicep/main.bicep \
+              --parameters "bicep/main.bicepparam" \
+              ${SESSION_HOST_PARAMS[@]+"${SESSION_HOST_PARAMS[@]}"} \
+              ${AVD_SP_PARAMS[@]+"${AVD_SP_PARAMS[@]}"}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Deploy – runs on push to main or manual trigger only
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy-platform:
+    name: 'Deploy: Platform'
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name != 'pull_request'
+    environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'production' }}
+
+    outputs:
+      targetEnvironment: ${{ steps.deploy.outputs.targetEnvironment }}
+      parameterFile: ${{ steps.deploy.outputs.parameterFile }}
+      resourceGroupName: ${{ steps.deploy.outputs.resourceGroupName }}
+      hostPoolResourceId: ${{ steps.deploy.outputs.hostPoolResourceId }}
+      applicationGroupResourceId: ${{ steps.deploy.outputs.applicationGroupResourceId }}
+      workspaceResourceId: ${{ steps.deploy.outputs.workspaceResourceId }}
+      scalingPlanResourceId: ${{ steps.deploy.outputs.scalingPlanResourceId }}
+      vnetResourceId: ${{ steps.deploy.outputs.vnetResourceId }}
+      avdshSubnetResourceId: ${{ steps.deploy.outputs.avdshSubnetResourceId }}
+      sessionHostResourceIds: ${{ steps.deploy.outputs.sessionHostResourceIds }}
+      sessionHostNames: ${{ steps.deploy.outputs.sessionHostNames }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Platform
+        id: deploy
+        uses: azure/cli@v2
+        env:
+          SESSION_HOST_ADMIN_PASSWORD: ${{ secrets.SESSION_HOST_ADMIN_PASSWORD }}
+          AVD_SP_OBJECT_ID_SECRET: ${{ secrets.AVD_SP_OBJECT_ID }}
+        with:
+          azcliversion: latest
+          inlineScript: |
+            TARGET_ENV="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'production' }}"
+            DEFAULT_PARAM_FILE="${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging') && 'bicep/main.staging.bicepparam' || 'bicep/main.bicepparam' }}"
+            OVERRIDE_PARAM_FILE="${{ github.event.inputs.parameterFileOverride || '' }}"
+
+            if [ -n "$OVERRIDE_PARAM_FILE" ]; then
+              if [[ ! "$OVERRIDE_PARAM_FILE" =~ ^bicep/[^/]+\.bicepparam$ ]]; then
+                echo "::error::parameterFileOverride must be a path directly under bicep/ ending in .bicepparam (e.g. bicep/main.staging.bicepparam)"
+                exit 1
+              fi
+              PARAM_FILE="$OVERRIDE_PARAM_FILE"
+            else
+              PARAM_FILE="$DEFAULT_PARAM_FILE"
+            fi
+
+            if [ ! -f "$PARAM_FILE" ]; then
+              echo "::error::Parameter file not found: $PARAM_FILE"
+              exit 1
+            fi
+
+            # Build optional session host secret overrides (values come from GitHub
+            # secrets so they are masked in logs and never stored in source files).
+            # The host pool registration token is generated automatically by the
+            # host-pool module at deploy time and does not need a pipeline secret.
+            SESSION_HOST_PARAMS=()
+            if [ -n "$SESSION_HOST_ADMIN_PASSWORD" ]; then
+              SESSION_HOST_PARAMS+=(--parameters "sessionHostAdminPassword=$SESSION_HOST_ADMIN_PASSWORD")
+            fi
+
+            # Resolve the AVD service principal object ID so the Bicep template can grant
+            # it "Desktop Virtualization Power On Off Contributor" on the resource group
+            # (required for the Scaling Plan to manage session host power state).
+            # App ID 9cdead84-a844-4324-93f2-b2e6bb768d07 is the well-known, fixed app ID for
+            # the Windows Virtual Desktop first-party service across all Azure tenants.
+            # Prefer the AVD_SP_OBJECT_ID repository secret (avoids needing Microsoft Graph
+            # permissions on the workload identity and guarantees the correct SP object ID).
+            # Falls back to az ad sp show if the secret is not configured and Graph permissions
+            # are available. If neither source yields a value, the RBAC module is skipped.
+            AVD_SP_PARAMS=()
+            if [ -n "$AVD_SP_OBJECT_ID_SECRET" ]; then
+              AVD_SP_OBJECT_ID="$AVD_SP_OBJECT_ID_SECRET"
+            else
+              set +e
+              AVD_SP_OBJECT_ID=$(az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07 --query id -o tsv 2>/dev/null)
+              set -e
+            fi
+            if [ -n "$AVD_SP_OBJECT_ID" ]; then
+              AVD_SP_PARAMS+=(--parameters "avdServicePrincipalObjectId=$AVD_SP_OBJECT_ID")
+            else
+              echo "::warning::Could not resolve avdServicePrincipalObjectId. Set the AVD_SP_OBJECT_ID repository secret (az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07 --query id -o tsv), or grant the deployment SP 'Application.Read.All'. The autoscale RBAC module will be skipped."
+            fi
+
+            # Deploy with retry to handle Azure RBAC propagation delay.
+            # On first deployment the AVD autoscale role assignment is created by ARM
+            # and the Scaling Plan immediately attempts to associate with the host pool.
+            # Azure's authorization service may not have propagated the new assignment
+            # within ARM's dependency-graph window, causing a transient 400 from the
+            # DesktopVirtualization control plane. A single retry after 120 s is
+            # sufficient to clear the propagation window on all subsequent runs.
+            DEPLOY_ATTEMPT=1
+            MAX_ATTEMPTS=2
+            DEPLOY_SUCCESS=false
+            while [ $DEPLOY_ATTEMPT -le $MAX_ATTEMPTS ]; do
+              if OUTPUT=$(az deployment sub create \
+                --name "avd-platform-deploy-${{ github.run_id }}-attempt${DEPLOY_ATTEMPT}" \
+                --location "${{ github.event.inputs.deploymentLocation || env.DEPLOYMENT_LOCATION }}" \
+                --template-file bicep/main.bicep \
+                --parameters "$PARAM_FILE" \
+                ${SESSION_HOST_PARAMS[@]+"${SESSION_HOST_PARAMS[@]}"} \
+                ${AVD_SP_PARAMS[@]+"${AVD_SP_PARAMS[@]}"} \
+                --query "properties.outputs" \
+                --output json 2>&1); then
+                DEPLOY_SUCCESS=true
+                break
+              else
+                if [ $DEPLOY_ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                  echo "::warning::Deployment attempt ${DEPLOY_ATTEMPT} failed. This may be due to RBAC propagation delay for the AVD autoscale role assignment. Waiting 120 s before retry..."
+                  sleep 120
+                fi
+              fi
+              DEPLOY_ATTEMPT=$((DEPLOY_ATTEMPT + 1))
+            done
+            if [ "$DEPLOY_SUCCESS" != "true" ]; then
+              echo "::error::Deployment failed after ${MAX_ATTEMPTS} attempts."
+              echo "$OUTPUT"
+              exit 1
+            fi
+            echo "targetEnvironment=$TARGET_ENV" >> $GITHUB_OUTPUT
+            echo "parameterFile=$PARAM_FILE" >> $GITHUB_OUTPUT
+            echo "resourceGroupName=$(echo $OUTPUT | jq -r '.resourceGroupName.value')" >> $GITHUB_OUTPUT
+            echo "hostPoolResourceId=$(echo $OUTPUT | jq -r '.hostPoolResourceId.value')" >> $GITHUB_OUTPUT
+            echo "applicationGroupResourceId=$(echo $OUTPUT | jq -r '.applicationGroupResourceId.value')" >> $GITHUB_OUTPUT
+            echo "workspaceResourceId=$(echo $OUTPUT | jq -r '.workspaceResourceId.value')" >> $GITHUB_OUTPUT
+            echo "scalingPlanResourceId=$(echo $OUTPUT | jq -r '.scalingPlanResourceId.value')" >> $GITHUB_OUTPUT
+            echo "vnetResourceId=$(echo $OUTPUT | jq -r '.vnetResourceId.value')" >> $GITHUB_OUTPUT
+            echo "avdshSubnetResourceId=$(echo $OUTPUT | jq -r '.avdshSubnetResourceId.value')" >> $GITHUB_OUTPUT
+            echo "sessionHostResourceIds=$(echo $OUTPUT | jq -r '.sessionHostResourceIds.value')" >> $GITHUB_OUTPUT
+            echo "sessionHostNames=$(echo $OUTPUT | jq -r '.sessionHostNames.value')" >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Summary – print deployment summary after all jobs complete
+  # ──────────────────────────────────────────────────────────────────────────
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-platform
+    if: always() && github.event_name != 'pull_request'
+    steps:
+      - name: Print summary
+        run: |
+          echo "## AVD Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform Orchestration | ${{ needs.deploy-platform.result == 'success' && '✅ Deployed' || '❌ Failed or Skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Environment:** \`${{ needs.deploy-platform.outputs.targetEnvironment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Parameter File:**     \`${{ needs.deploy-platform.outputs.parameterFile }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Resource Group:** \`${{ needs.deploy-platform.outputs.resourceGroupName }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Subscription:**   \`${{ secrets.AZURE_SUBSCRIPTION_ID }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:**   ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ needs.deploy-platform.outputs.vnetResourceId }}" ] && [ "${{ needs.deploy-platform.outputs.vnetResourceId }}" != "" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Virtual Network (when enabled)" >> $GITHUB_STEP_SUMMARY
+            echo "**VNet Subnet (AVD Session Hosts):** \`${{ needs.deploy-platform.outputs.avdshSubnetResourceId }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -n "${{ needs.deploy-platform.outputs.sessionHostNames }}" ] && [ "${{ needs.deploy-platform.outputs.sessionHostNames }}" != "[]" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Session Hosts (when enabled)" >> $GITHUB_STEP_SUMMARY
+            echo "**VM Names:** \`${{ needs.deploy-platform.outputs.sessionHostNames }}\`" >> $GITHUB_STEP_SUMMARY
+          fi

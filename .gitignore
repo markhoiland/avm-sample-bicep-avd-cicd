@@ -1,0 +1,17 @@
+# Generated ARM templates (bicep build output)
+**/*.json
+!bicepconfig.json
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Bicep cache
+.bicep/

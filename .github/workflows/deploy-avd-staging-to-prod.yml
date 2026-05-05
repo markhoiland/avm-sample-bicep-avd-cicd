@@ -1,0 +1,469 @@
+# ============================================================================
+# deploy-avd-staging-to-prod.yml  –  Staging → Production Promotion Pipeline
+# ============================================================================
+# Deploys AVD infrastructure to the staging environment first, then optionally
+# promotes to production after explicit approval.
+#
+# Flow:
+#   validate
+#     ├─► what-if-staging   (preview staging changes, no Azure writes)
+#     └─► deploy-staging    (deploy to staging environment)
+#             │
+#             └─► what-if-production  (preview production changes)
+#                         │
+#                         └─► deploy-production  (deploy to production, requires environment approval)
+#                                     │
+#                                     └─► summary
+#
+# Triggers:
+#   • workflow_dispatch  – manual trigger; choose whether to promote to production after staging
+#   • push to main       – auto-deploy staging only (production promotion requires manual dispatch)
+#
+# Authentication: OpenID Connect (OIDC) – no long-lived credentials stored.
+# Required secrets (set in GitHub → Settings → Secrets and Variables → Actions):
+#   AZURE_CLIENT_ID       – App Registration client/application ID
+#   AZURE_TENANT_ID       – Entra ID (Azure AD) tenant ID
+#   AZURE_SUBSCRIPTION_ID – Target Azure subscription ID
+#
+# Optional secrets:
+#   SESSION_HOST_ADMIN_PASSWORD – Local admin password for session host VMs
+#   AVD_SP_OBJECT_ID            – Windows Virtual Desktop SP object ID for autoscale RBAC
+#
+# GitHub Environments required:
+#   staging    – target environment for staging deployments
+#   production – target environment for production deployments; add protection rules
+#                (e.g. required reviewers) to gate the production promotion
+# ============================================================================
+
+name: Deploy AVD (Staging → Production)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bicep/main.bicep'
+      - 'bicep/main.bicepparam'
+      - 'bicep/main.staging.bicepparam'
+      - 'bicep/modules/**'
+      - '.github/workflows/deploy-avd-staging-to-prod.yml'
+  workflow_dispatch:
+    inputs:
+      promoteToProduction:
+        description: 'Promote to production after staging succeeds?'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      deploymentLocation:
+        description: 'Azure region for subscription deployment metadata'
+        required: false
+        default: 'eastus'
+        type: string
+
+permissions:
+  id-token: write   # Required for OIDC token request
+  contents: read    # Required to checkout the repository
+
+env:
+  BICEP_VERSION: 'latest'
+  DEPLOYMENT_LOCATION: 'eastus'
+  STAGING_PARAM_FILE: 'bicep/main.staging.bicepparam'
+  PRODUCTION_PARAM_FILE: 'bicep/main.bicepparam'
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Validate – lint all Bicep templates; runs on every trigger; no Azure calls
+  # ──────────────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate Bicep Templates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Bicep CLI
+        run: |
+          curl -Lo /tmp/bicep-linux-x64 https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x /tmp/bicep-linux-x64
+          sudo mv /tmp/bicep-linux-x64 /usr/local/bin/bicep
+          bicep --version
+
+      - name: Build / lint host-pool
+        run: bicep build bicep/modules/host-pool/main.bicep
+
+      - name: Build / lint application-group
+        run: bicep build bicep/modules/application-group/main.bicep
+
+      - name: Build / lint workspace
+        run: bicep build bicep/modules/workspace/main.bicep
+
+      - name: Build / lint scaling-plan
+        run: bicep build bicep/modules/scaling-plan/main.bicep
+
+      - name: Build / lint avd-autoscale-rbac
+        run: bicep build bicep/modules/avd-autoscale-rbac/main.bicep
+
+      - name: Build / lint vnet
+        run: bicep build bicep/modules/vnet/main.bicep
+
+      - name: Build / lint session-hosts
+        run: bicep build bicep/modules/session-hosts/main.bicep
+
+      - name: Build / lint platform orchestration
+        run: bicep build bicep/main.bicep
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # What-if staging – preview staging changes; no Azure writes
+  # ──────────────────────────────────────────────────────────────────────────
+  what-if-staging:
+    name: 'What-If: Staging'
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-if – Staging
+        uses: azure/cli@v2
+        env:
+          SESSION_HOST_ADMIN_PASSWORD: ${{ secrets.SESSION_HOST_ADMIN_PASSWORD }}
+          AVD_SP_OBJECT_ID_SECRET: ${{ secrets.AVD_SP_OBJECT_ID }}
+        with:
+          azcliversion: latest
+          inlineScript: |
+            SESSION_HOST_PARAMS=()
+            if [ -n "$SESSION_HOST_ADMIN_PASSWORD" ]; then
+              SESSION_HOST_PARAMS+=(--parameters "sessionHostAdminPassword=$SESSION_HOST_ADMIN_PASSWORD")
+            fi
+
+            AVD_SP_PARAMS=()
+            if [ -n "$AVD_SP_OBJECT_ID_SECRET" ]; then
+              AVD_SP_OBJECT_ID="$AVD_SP_OBJECT_ID_SECRET"
+            else
+              set +e
+              AVD_SP_OBJECT_ID=$(az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07 --query id -o tsv 2>/dev/null)
+              set -e
+            fi
+            if [ -n "$AVD_SP_OBJECT_ID" ]; then
+              AVD_SP_PARAMS+=(--parameters "avdServicePrincipalObjectId=$AVD_SP_OBJECT_ID")
+            else
+              echo "::warning::Could not resolve avdServicePrincipalObjectId. Set the AVD_SP_OBJECT_ID repository secret or grant the deployment SP 'Application.Read.All'. The autoscale RBAC module will be skipped."
+            fi
+
+            az deployment sub what-if \
+              --name "avd-staging-whatif-${{ github.run_id }}" \
+              --location "${{ github.event.inputs.deploymentLocation || env.DEPLOYMENT_LOCATION }}" \
+              --template-file bicep/main.bicep \
+              --parameters "${{ env.STAGING_PARAM_FILE }}" \
+              ${SESSION_HOST_PARAMS[@]+"${SESSION_HOST_PARAMS[@]}"} \
+              ${AVD_SP_PARAMS[@]+"${AVD_SP_PARAMS[@]}"}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Deploy staging – runs after what-if-staging passes
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: 'Deploy: Staging'
+    runs-on: ubuntu-latest
+    needs: what-if-staging
+    environment: staging
+
+    outputs:
+      resourceGroupName: ${{ steps.deploy.outputs.resourceGroupName }}
+      hostPoolResourceId: ${{ steps.deploy.outputs.hostPoolResourceId }}
+      applicationGroupResourceId: ${{ steps.deploy.outputs.applicationGroupResourceId }}
+      workspaceResourceId: ${{ steps.deploy.outputs.workspaceResourceId }}
+      scalingPlanResourceId: ${{ steps.deploy.outputs.scalingPlanResourceId }}
+      vnetResourceId: ${{ steps.deploy.outputs.vnetResourceId }}
+      avdshSubnetResourceId: ${{ steps.deploy.outputs.avdshSubnetResourceId }}
+      sessionHostResourceIds: ${{ steps.deploy.outputs.sessionHostResourceIds }}
+      sessionHostNames: ${{ steps.deploy.outputs.sessionHostNames }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Staging
+        id: deploy
+        uses: azure/cli@v2
+        env:
+          SESSION_HOST_ADMIN_PASSWORD: ${{ secrets.SESSION_HOST_ADMIN_PASSWORD }}
+          AVD_SP_OBJECT_ID_SECRET: ${{ secrets.AVD_SP_OBJECT_ID }}
+        with:
+          azcliversion: latest
+          inlineScript: |
+            SESSION_HOST_PARAMS=()
+            if [ -n "$SESSION_HOST_ADMIN_PASSWORD" ]; then
+              SESSION_HOST_PARAMS+=(--parameters "sessionHostAdminPassword=$SESSION_HOST_ADMIN_PASSWORD")
+            fi
+
+            AVD_SP_PARAMS=()
+            if [ -n "$AVD_SP_OBJECT_ID_SECRET" ]; then
+              AVD_SP_OBJECT_ID="$AVD_SP_OBJECT_ID_SECRET"
+            else
+              set +e
+              AVD_SP_OBJECT_ID=$(az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07 --query id -o tsv 2>/dev/null)
+              set -e
+            fi
+            if [ -n "$AVD_SP_OBJECT_ID" ]; then
+              AVD_SP_PARAMS+=(--parameters "avdServicePrincipalObjectId=$AVD_SP_OBJECT_ID")
+            else
+              echo "::warning::Could not resolve avdServicePrincipalObjectId. Set the AVD_SP_OBJECT_ID repository secret or grant the deployment SP 'Application.Read.All'. The autoscale RBAC module will be skipped."
+            fi
+
+            DEPLOY_ATTEMPT=1
+            MAX_ATTEMPTS=2
+            DEPLOY_SUCCESS=false
+            while [ $DEPLOY_ATTEMPT -le $MAX_ATTEMPTS ]; do
+              if OUTPUT=$(az deployment sub create \
+                --name "avd-staging-deploy-${{ github.run_id }}-attempt${DEPLOY_ATTEMPT}" \
+                --location "${{ github.event.inputs.deploymentLocation || env.DEPLOYMENT_LOCATION }}" \
+                --template-file bicep/main.bicep \
+                --parameters "${{ env.STAGING_PARAM_FILE }}" \
+                ${SESSION_HOST_PARAMS[@]+"${SESSION_HOST_PARAMS[@]}"} \
+                ${AVD_SP_PARAMS[@]+"${AVD_SP_PARAMS[@]}"} \
+                --query "properties.outputs" \
+                --output json 2>&1); then
+                DEPLOY_SUCCESS=true
+                break
+              else
+                if [ $DEPLOY_ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                  echo "::warning::Staging deployment attempt ${DEPLOY_ATTEMPT} failed. Waiting 120 s before retry (RBAC propagation delay)..."
+                  sleep 120
+                fi
+              fi
+              DEPLOY_ATTEMPT=$((DEPLOY_ATTEMPT + 1))
+            done
+            if [ "$DEPLOY_SUCCESS" != "true" ]; then
+              echo "::error::Staging deployment failed after ${MAX_ATTEMPTS} attempts."
+              echo "$OUTPUT"
+              exit 1
+            fi
+            echo "resourceGroupName=$(echo $OUTPUT | jq -r '.resourceGroupName.value')" >> $GITHUB_OUTPUT
+            echo "hostPoolResourceId=$(echo $OUTPUT | jq -r '.hostPoolResourceId.value')" >> $GITHUB_OUTPUT
+            echo "applicationGroupResourceId=$(echo $OUTPUT | jq -r '.applicationGroupResourceId.value')" >> $GITHUB_OUTPUT
+            echo "workspaceResourceId=$(echo $OUTPUT | jq -r '.workspaceResourceId.value')" >> $GITHUB_OUTPUT
+            echo "scalingPlanResourceId=$(echo $OUTPUT | jq -r '.scalingPlanResourceId.value')" >> $GITHUB_OUTPUT
+            echo "vnetResourceId=$(echo $OUTPUT | jq -r '.vnetResourceId.value')" >> $GITHUB_OUTPUT
+            echo "avdshSubnetResourceId=$(echo $OUTPUT | jq -r '.avdshSubnetResourceId.value')" >> $GITHUB_OUTPUT
+            echo "sessionHostResourceIds=$(echo $OUTPUT | jq -r '.sessionHostResourceIds.value')" >> $GITHUB_OUTPUT
+            echo "sessionHostNames=$(echo $OUTPUT | jq -r '.sessionHostNames.value')" >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # What-if production – preview production changes after staging succeeds.
+  # Only runs when promoteToProduction is 'true' (manual dispatch) or on push.
+  # On plain push to main, this acts as a dry-run preview for production.
+  # ──────────────────────────────────────────────────────────────────────────
+  what-if-production:
+    name: 'What-If: Production'
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'push' || github.event.inputs.promoteToProduction == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-if – Production
+        uses: azure/cli@v2
+        env:
+          SESSION_HOST_ADMIN_PASSWORD: ${{ secrets.SESSION_HOST_ADMIN_PASSWORD }}
+          AVD_SP_OBJECT_ID_SECRET: ${{ secrets.AVD_SP_OBJECT_ID }}
+        with:
+          azcliversion: latest
+          inlineScript: |
+            SESSION_HOST_PARAMS=()
+            if [ -n "$SESSION_HOST_ADMIN_PASSWORD" ]; then
+              SESSION_HOST_PARAMS+=(--parameters "sessionHostAdminPassword=$SESSION_HOST_ADMIN_PASSWORD")
+            fi
+
+            AVD_SP_PARAMS=()
+            if [ -n "$AVD_SP_OBJECT_ID_SECRET" ]; then
+              AVD_SP_OBJECT_ID="$AVD_SP_OBJECT_ID_SECRET"
+            else
+              set +e
+              AVD_SP_OBJECT_ID=$(az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07 --query id -o tsv 2>/dev/null)
+              set -e
+            fi
+            if [ -n "$AVD_SP_OBJECT_ID" ]; then
+              AVD_SP_PARAMS+=(--parameters "avdServicePrincipalObjectId=$AVD_SP_OBJECT_ID")
+            else
+              echo "::warning::Could not resolve avdServicePrincipalObjectId. Set the AVD_SP_OBJECT_ID repository secret or grant the deployment SP 'Application.Read.All'. The autoscale RBAC module will be skipped."
+            fi
+
+            az deployment sub what-if \
+              --name "avd-prod-whatif-${{ github.run_id }}" \
+              --location "${{ github.event.inputs.deploymentLocation || env.DEPLOYMENT_LOCATION }}" \
+              --template-file bicep/main.bicep \
+              --parameters "${{ env.PRODUCTION_PARAM_FILE }}" \
+              ${SESSION_HOST_PARAMS[@]+"${SESSION_HOST_PARAMS[@]}"} \
+              ${AVD_SP_PARAMS[@]+"${AVD_SP_PARAMS[@]}"}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Deploy production – only runs when promoteToProduction is 'true'
+  # The 'production' GitHub Environment can enforce required-reviewer approval.
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: 'Deploy: Production'
+    runs-on: ubuntu-latest
+    needs: what-if-production
+    if: github.event.inputs.promoteToProduction == 'true'
+    environment: production
+
+    outputs:
+      resourceGroupName: ${{ steps.deploy.outputs.resourceGroupName }}
+      hostPoolResourceId: ${{ steps.deploy.outputs.hostPoolResourceId }}
+      applicationGroupResourceId: ${{ steps.deploy.outputs.applicationGroupResourceId }}
+      workspaceResourceId: ${{ steps.deploy.outputs.workspaceResourceId }}
+      scalingPlanResourceId: ${{ steps.deploy.outputs.scalingPlanResourceId }}
+      vnetResourceId: ${{ steps.deploy.outputs.vnetResourceId }}
+      avdshSubnetResourceId: ${{ steps.deploy.outputs.avdshSubnetResourceId }}
+      sessionHostResourceIds: ${{ steps.deploy.outputs.sessionHostResourceIds }}
+      sessionHostNames: ${{ steps.deploy.outputs.sessionHostNames }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Production
+        id: deploy
+        uses: azure/cli@v2
+        env:
+          SESSION_HOST_ADMIN_PASSWORD: ${{ secrets.SESSION_HOST_ADMIN_PASSWORD }}
+          AVD_SP_OBJECT_ID_SECRET: ${{ secrets.AVD_SP_OBJECT_ID }}
+        with:
+          azcliversion: latest
+          inlineScript: |
+            SESSION_HOST_PARAMS=()
+            if [ -n "$SESSION_HOST_ADMIN_PASSWORD" ]; then
+              SESSION_HOST_PARAMS+=(--parameters "sessionHostAdminPassword=$SESSION_HOST_ADMIN_PASSWORD")
+            fi
+
+            AVD_SP_PARAMS=()
+            if [ -n "$AVD_SP_OBJECT_ID_SECRET" ]; then
+              AVD_SP_OBJECT_ID="$AVD_SP_OBJECT_ID_SECRET"
+            else
+              set +e
+              AVD_SP_OBJECT_ID=$(az ad sp show --id 9cdead84-a844-4324-93f2-b2e6bb768d07 --query id -o tsv 2>/dev/null)
+              set -e
+            fi
+            if [ -n "$AVD_SP_OBJECT_ID" ]; then
+              AVD_SP_PARAMS+=(--parameters "avdServicePrincipalObjectId=$AVD_SP_OBJECT_ID")
+            else
+              echo "::warning::Could not resolve avdServicePrincipalObjectId. Set the AVD_SP_OBJECT_ID repository secret or grant the deployment SP 'Application.Read.All'. The autoscale RBAC module will be skipped."
+            fi
+
+            DEPLOY_ATTEMPT=1
+            MAX_ATTEMPTS=2
+            DEPLOY_SUCCESS=false
+            while [ $DEPLOY_ATTEMPT -le $MAX_ATTEMPTS ]; do
+              if OUTPUT=$(az deployment sub create \
+                --name "avd-prod-deploy-${{ github.run_id }}-attempt${DEPLOY_ATTEMPT}" \
+                --location "${{ github.event.inputs.deploymentLocation || env.DEPLOYMENT_LOCATION }}" \
+                --template-file bicep/main.bicep \
+                --parameters "${{ env.PRODUCTION_PARAM_FILE }}" \
+                ${SESSION_HOST_PARAMS[@]+"${SESSION_HOST_PARAMS[@]}"} \
+                ${AVD_SP_PARAMS[@]+"${AVD_SP_PARAMS[@]}"} \
+                --query "properties.outputs" \
+                --output json 2>&1); then
+                DEPLOY_SUCCESS=true
+                break
+              else
+                if [ $DEPLOY_ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                  echo "::warning::Production deployment attempt ${DEPLOY_ATTEMPT} failed. Waiting 120 s before retry (RBAC propagation delay)..."
+                  sleep 120
+                fi
+              fi
+              DEPLOY_ATTEMPT=$((DEPLOY_ATTEMPT + 1))
+            done
+            if [ "$DEPLOY_SUCCESS" != "true" ]; then
+              echo "::error::Production deployment failed after ${MAX_ATTEMPTS} attempts."
+              echo "$OUTPUT"
+              exit 1
+            fi
+            echo "resourceGroupName=$(echo $OUTPUT | jq -r '.resourceGroupName.value')" >> $GITHUB_OUTPUT
+            echo "hostPoolResourceId=$(echo $OUTPUT | jq -r '.hostPoolResourceId.value')" >> $GITHUB_OUTPUT
+            echo "applicationGroupResourceId=$(echo $OUTPUT | jq -r '.applicationGroupResourceId.value')" >> $GITHUB_OUTPUT
+            echo "workspaceResourceId=$(echo $OUTPUT | jq -r '.workspaceResourceId.value')" >> $GITHUB_OUTPUT
+            echo "scalingPlanResourceId=$(echo $OUTPUT | jq -r '.scalingPlanResourceId.value')" >> $GITHUB_OUTPUT
+            echo "vnetResourceId=$(echo $OUTPUT | jq -r '.vnetResourceId.value')" >> $GITHUB_OUTPUT
+            echo "avdshSubnetResourceId=$(echo $OUTPUT | jq -r '.avdshSubnetResourceId.value')" >> $GITHUB_OUTPUT
+            echo "sessionHostResourceIds=$(echo $OUTPUT | jq -r '.sessionHostResourceIds.value')" >> $GITHUB_OUTPUT
+            echo "sessionHostNames=$(echo $OUTPUT | jq -r '.sessionHostNames.value')" >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Summary – print a unified deployment summary after all jobs complete
+  # ──────────────────────────────────────────────────────────────────────────
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-staging
+      - what-if-production
+      - deploy-production
+    if: always()
+    steps:
+      - name: Print summary
+        run: |
+          echo "## AVD Staging → Production Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Staging | ${{ needs.deploy-staging.result == 'success' && '✅ Deployed' || needs.deploy-staging.result == 'skipped' && '⏭ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Production What-If | ${{ needs.what-if-production.result == 'success' && '✅ Passed' || needs.what-if-production.result == 'skipped' && '⏭ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Production | ${{ needs.deploy-production.result == 'success' && '✅ Deployed' || needs.deploy-production.result == 'skipped' && '⏭ Skipped (not promoted)' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Promote to production:** \`${{ github.event.inputs.promoteToProduction || 'false (push trigger)' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.deploy-staging.result }}" = "success" ]; then
+            echo "### Staging" >> $GITHUB_STEP_SUMMARY
+            echo "**Resource Group:** \`${{ needs.deploy-staging.outputs.resourceGroupName }}\`" >> $GITHUB_STEP_SUMMARY
+            if [ -n "${{ needs.deploy-staging.outputs.sessionHostNames }}" ] && [ "${{ needs.deploy-staging.outputs.sessionHostNames }}" != "[]" ]; then
+              echo "**Session Hosts:** \`${{ needs.deploy-staging.outputs.sessionHostNames }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+          if [ "${{ needs.deploy-production.result }}" = "success" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Production" >> $GITHUB_STEP_SUMMARY
+            echo "**Resource Group:** \`${{ needs.deploy-production.outputs.resourceGroupName }}\`" >> $GITHUB_STEP_SUMMARY
+            if [ -n "${{ needs.deploy-production.outputs.vnetResourceId }}" ] && [ "${{ needs.deploy-production.outputs.vnetResourceId }}" != "" ]; then
+              echo "**VNet Subnet (AVD Session Hosts):** \`${{ needs.deploy-production.outputs.avdshSubnetResourceId }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            if [ -n "${{ needs.deploy-production.outputs.sessionHostNames }}" ] && [ "${{ needs.deploy-production.outputs.sessionHostNames }}" != "[]" ]; then
+              echo "**Session Hosts:** \`${{ needs.deploy-production.outputs.sessionHostNames }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi

@@ -48,7 +48,7 @@ subnetResourceId: !empty(sessionHostSubnetResourceId)
 | `logAnalyticsWorkspaceResourceId` | `string` | | `''` | Resource ID of a Log Analytics Workspace for VNet diagnostics. Leave empty to skip. |
 | `tags` | `object` | | `{}` | Tags applied to all resources deployed by this module. |
 
-> **Note on Log Analytics cross-subscription:** The deployment principal requires `Microsoft.OperationalInsights/workspaces/sharedKeys/action` on the linked workspace. Cross-subscription references are typically denied. Use a workspace in the same subscription as the AVD resources, or leave the parameter empty.
+> **Note on Log Analytics cross-subscription:** The deployment principal requires `Microsoft.OperationalInsights/workspaces/sharedkeys/action` on the linked workspace. Cross-subscription references are typically denied. Use a workspace in the same subscription as the AVD resources, or leave the parameter empty.
 
 ### `additionalSubnets` array — element shape
 

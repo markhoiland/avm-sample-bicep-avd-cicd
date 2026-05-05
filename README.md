@@ -42,7 +42,7 @@
 
 ## Overview
 
-This repository provides a production-ready Infrastructure-as-Code (IaC) foundation for deploying **Azure Virtual Desktop** using:
+This repository provides an Infrastructure-as-Code (IaC) foundation for deploying **Azure Virtual Desktop** using:
 
 | Pillar | Technology |
 |--------|-----------|

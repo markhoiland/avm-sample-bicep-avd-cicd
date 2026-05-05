@@ -1,4 +1,4 @@
-# AVM Bicep Sample for AVD with Github Actions
+# AVM Bicep Sample for AVD with GitHub Actions
 
 > **Bootstrap an Azure Virtual Desktop (AVD) environment using Bicep Azure Verified Modules with a secure, OIDC-based GitHub Actions CI/CD pipeline.**
 
